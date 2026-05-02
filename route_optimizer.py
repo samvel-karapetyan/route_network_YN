@@ -62,14 +62,14 @@ RouteSet = list[Route]     # R routes forming one "solution"
 # ── Parameters ────────────────────────────────────────────────────────────────
 DATA_DIR        = Path("data")
 
-R               = 70       # routes per route set
+R               = 74       # routes per route set
 N_POP           = 20       # population size
 M_COPIES        = 5        # copies per string in MODIFY (pool size = N_POP × M_COPIES)
 K_INS           = 200      # INS cardinality (top-K most-active nodes)
 MAX_NODES_ROUTE = 25       # max stops per route (M)
 MAX_LEN_ROUTE   = 30.0     # max route length in km (L)
 U_TRANSFER      = 5.0      # transfer penalty (same units as edge weights, km here)
-MAX_GENERATIONS  = 100     # GA iterations
+MAX_GENERATIONS  = 1000     # GA iterations
 CROSSOVER_PROB   = 0.5     # inter-string crossover probability
 MUTATION_PROB    = 0.01    # per-node mutation probability
 CHECKPOINT_EVERY = 10      # save routes snapshot every N generations (0 = disabled)
@@ -793,13 +793,12 @@ def main() -> None:
         # ── GA Main Loop ──────────────────────────────────────────────────────
         for gen in range(MAX_GENERATIONS):
             t0 = time.time()
-
+            
+            expanded: list[RouteSet] = []
             # 1. Expand: M_COPIES deep copies of each string
-            expanded: list[RouteSet] = [
-                copy.deepcopy(rs)
-                for rs in population
-                for _ in range(M_COPIES)
-            ]
+            for _ in range(M_COPIES):
+                for rs in population:
+                    expanded.append(copy.deepcopy(rs))
 
             # 2. Intra-string crossover on every copy
             expanded = [crossover_intra(rs, rng) for rs in expanded]
