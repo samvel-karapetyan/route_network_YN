@@ -20,6 +20,7 @@ import copy
 import csv
 import heapq
 import json
+import math
 import random
 import time
 from pathlib import Path
@@ -64,6 +65,7 @@ DATA_DIR        = Path("data")
 
 R               = 74       # routes per route set
 N_POP           = 20       # population size
+ELITE_COUNT     = 2        # top individuals carried unchanged; must be < N_POP
 M_COPIES        = 5        # copies per string in MODIFY (pool size = N_POP × M_COPIES)
 K_INS           = 200      # INS cardinality (top-K most-active nodes)
 MAX_NODES_ROUTE = 25       # max stops per route (M)
@@ -71,8 +73,12 @@ MAX_LEN_ROUTE   = 30.0     # max route length in km (L)
 U_TRANSFER      = 5.0      # transfer penalty (same units as edge weights, km here)
 MAX_GENERATIONS  = 1000     # GA iterations
 CROSSOVER_PROB   = 0.5     # inter-string crossover probability
-MUTATION_PROB    = 0.01    # per-node mutation probability
+MUTATION_PROB    = 0.1    # per-node mutation probability
 CHECKPOINT_EVERY = 10      # save routes snapshot every N generations (0 = disabled)
+
+# Intra crossover: skip tail-swap if any distinct stop from one branch vs the other
+# is closer than this (Haversine, meters). All pairs across the two branches are checked.
+MIN_SPLICE_SEPARATION_M = 100.0
 
 # Fitness weights (ω1, ω2, ω3)
 OMEGA           = (1.0, 1.0, 1.0)
@@ -538,11 +544,44 @@ def crossover_inter(
     child2: RouteSet = [r[:] for r in rs2[:cut]] + [r[:] for r in rs1[cut:]]
     return child1, child2
 
+def haversine(lat1, lon1, lat2, lon2):
+    R = 6371  # Earth radius in km
 
-def crossover_intra(rs: RouteSet, rng: random.Random) -> RouteSet:
+    phi1 = math.radians(float(lat1))
+    phi2 = math.radians(float(lat2))
+    dphi = math.radians(float(lat2) - float(lat1))
+    dlambda = math.radians(float(lon2) - float(lon1))
+
+    a = math.sin(dphi/2)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda/2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+    return R * c  # distance in km
+
+def distance(node1: str, node2: str, gd: GraphData) -> float:
+    return haversine(gd.nodes[node1]['coords']['lat'], 
+    gd.nodes[node1]['coords']['lng'], 
+    gd.nodes[node2]['coords']['lat'], 
+    gd.nodes[node2]['coords']['lng'])
+
+def good_route(route: Route, gd: GraphData) -> bool:
+    for node1 in route:
+        for node2 in route:
+            if node1 != node2 and distance(node1, node2, gd) < MIN_SPLICE_SEPARATION_M:
+                return False
+    
+    if len(route) < 19 or len(route) > 100:
+        return False
+    
+    return True
+
+
+def crossover_intra(rs: RouteSet, rng: random.Random, gd: GraphData) -> RouteSet:
     """
     Intra-string crossover (Figure 5): pick two routes sharing a common node,
     exchange tails at that node. Returns a modified shallow copy.
+
+    Splices are skipped if any distinct stop pair across the two splice branches
+    (tail vs head on each side) is closer than MIN_SPLICE_SEPARATION_M.
     """
     rs = [r[:] for r in rs]
     if len(rs) < 2:
@@ -551,7 +590,7 @@ def crossover_intra(rs: RouteSet, rng: random.Random) -> RouteSet:
     indices = list(range(len(rs)))
     rng.shuffle(indices)
 
-    for attempt in range(min(20, len(rs) * (len(rs) - 1) // 2)):
+    for attempt in range(40):
         r1_idx = rng.choice(indices)
         r2_idx = rng.choice(indices)
         if r1_idx == r2_idx:
@@ -569,7 +608,7 @@ def crossover_intra(rs: RouteSet, rng: random.Random) -> RouteSet:
         new_r1 = r1[: k1 + 1] + r2[k2 + 1:]
         new_r2 = r2[: k2 + 1] + r1[k1 + 1:]
 
-        if len(new_r1) >= 2 and len(new_r2) >= 2:
+        if good_route(new_r1, gd) and good_route(new_r2, gd):
             rs[r1_idx] = new_r1
             rs[r2_idx] = new_r2
             break
@@ -674,13 +713,20 @@ def tournament_select(
     n_select: int,
     m: int,
     rng: random.Random,
+    exclude_indices: set[int] | None = None,
 ) -> tuple[list[RouteSet], list[float]]:
     """
     Tournament selection (Section 3.3): group all N×m strings into batches
     of 2m, pick the highest-fitness string from each batch, keep 2 copies
     → total N strings for next generation. Returns (selected, fitnesses).
+
+    exclude_indices: pool indices to omit (e.g. elite slots already taken).
     """
-    combined = list(zip(population, fitnesses))
+    combined = [
+        (population[i], fitnesses[i])
+        for i in range(len(population))
+        if exclude_indices is None or i not in exclude_indices
+    ]
     rng.shuffle(combined)
 
     selected: list[RouteSet] = []
@@ -737,6 +783,12 @@ def _save_checkpoint(gen: int, route_set: RouteSet, totfit: float, metrics: dict
 def main() -> None:
     rng = random.Random(RANDOM_SEED)
     np.random.seed(RANDOM_SEED)
+
+    if ELITE_COUNT > 0:
+        if ELITE_COUNT >= N_POP:
+            raise ValueError("ELITE_COUNT must be < N_POP")
+        if (N_POP - ELITE_COUNT) % 2 != 0:
+            raise ValueError("N_POP - ELITE_COUNT must be even (tournament emits winner pairs)")
 
     print("Loading data …")
     gd = load_graph_data()
@@ -800,39 +852,67 @@ def main() -> None:
                 for rs in population:
                     expanded.append(copy.deepcopy(rs))
 
-            # 2. Intra-string crossover on every copy
-            expanded = [crossover_intra(rs, rng) for rs in expanded]
+            # 2–4. Variation operators (skip copies of elite population slots 0..ELITE_COUNT-1)
+            def _exp_is_elite_slot(i: int) -> bool:
+                return ELITE_COUNT > 0 and (i % N_POP) < ELITE_COUNT
 
-            # 3. Inter-string crossover between adjacent pairs (prob = CROSSOVER_PROB)
+            expanded = [
+                rs if _exp_is_elite_slot(i) else crossover_intra(rs, rng, gd)
+                for i, rs in enumerate(expanded)
+            ]
+
             for i in range(0, len(expanded) - 1, 2):
+                if _exp_is_elite_slot(i) or _exp_is_elite_slot(i + 1):
+                    continue
                 if rng.random() < CROSSOVER_PROB:
                     expanded[i], expanded[i + 1] = crossover_inter(
                         expanded[i], expanded[i + 1], rng
                     )
 
-            # 4. Mutation
-            expanded = [mutate(rs, gd, rng) for rs in expanded]
+            expanded = [
+                rs if _exp_is_elite_slot(i) else mutate(rs, gd, rng)
+                for i, rs in enumerate(expanded)
+            ]
 
             # 5. Evaluate expanded pool
             exp_fitnesses: list[float] = []
-            exp_best_metrics: dict = {}
+            exp_metrics_list: list[dict] = []
             for rs in expanded:
                 fit, metrics = eval_route_set(rs, gd.demand, t_min, gd)
                 exp_fitnesses.append(fit)
+                exp_metrics_list.append(metrics)
                 if fit > best_fit:
                     best_fit = fit
                     best_rs = [r[:] for r in rs]
                     best_metrics = metrics
 
-            # 6. Tournament selection → next generation (reuse already-computed fitnesses)
-            population, fitnesses = tournament_select(
-                expanded, exp_fitnesses, N_POP, M_COPIES, rng
-            )
+            # 6. Elitism + tournament → next generation
+            if ELITE_COUNT <= 0:
+                population, fitnesses = tournament_select(
+                    expanded, exp_fitnesses, N_POP, M_COPIES, rng
+                )
+            else:
+                order = np.argsort(exp_fitnesses)
+                elite_indices = [int(order[-1 - k]) for k in range(ELITE_COUNT)]
+                exclude_set = set(elite_indices)
+                elites_rs = [copy.deepcopy(expanded[j]) for j in elite_indices]
+                elites_fit = [exp_fitnesses[j] for j in elite_indices]
+
+                rest, rest_fit = tournament_select(
+                    expanded,
+                    exp_fitnesses,
+                    N_POP - ELITE_COUNT,
+                    M_COPIES,
+                    rng,
+                    exclude_indices=exclude_set,
+                )
+                population = elites_rs + rest
+                fitnesses = elites_fit + rest_fit
 
             # Best of this generation (from expanded pool)
             gen_best_idx = int(np.argmax(exp_fitnesses))
             gen_best_fit = exp_fitnesses[gen_best_idx]
-            _, gen_metrics = eval_route_set(expanded[gen_best_idx], gd.demand, t_min, gd)
+            gen_metrics = exp_metrics_list[gen_best_idx]
 
             elapsed = time.time() - t0
             m = gen_metrics
