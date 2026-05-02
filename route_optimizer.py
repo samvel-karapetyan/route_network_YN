@@ -98,13 +98,13 @@ class GraphData(NamedTuple):
 
 
 def load_graph_data() -> GraphData:
-    with open(DATA_DIR / "transitGraph.json") as f:
+    with open(DATA_DIR / "transitGraph.json", encoding="utf-8") as f:
         graph = json.load(f)
 
     nodes: dict = graph["nodes"]
     raw_edges: dict = graph["edges"]
 
-    with open(DATA_DIR / "node_index.json") as f:
+    with open(DATA_DIR / "node_index.json", encoding="utf-8") as f:
         id_to_idx: dict[str, int] = json.load(f)
 
     node_ids: list[str] = list(id_to_idx.keys())
@@ -133,7 +133,7 @@ def load_graph_data() -> GraphData:
 
 def load_existing_routes(id_to_idx: dict[str, int]) -> list[Route]:
     """Parse allYerevanTransportLines.json → list of valid stop-ID sequences."""
-    with open(DATA_DIR / "allYerevanTransportLines.json") as f:
+    with open(DATA_DIR / "allYerevanTransportLines.json", encoding="utf-8") as f:
         lines: list[dict] = json.load(f)
 
     valid_ids = set(id_to_idx.keys())
