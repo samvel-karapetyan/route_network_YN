@@ -67,18 +67,20 @@ R               = 74       # routes per route set
 N_POP           = 20       # population size
 ELITE_COUNT     = 2        # top individuals carried unchanged; must be < N_POP
 M_COPIES        = 5        # copies per string in MODIFY (pool size = N_POP × M_COPIES)
-K_INS           = 200      # INS cardinality (top-K most-active nodes)
-MAX_NODES_ROUTE = 25       # max stops per route (M)
-MAX_LEN_ROUTE   = 30.0     # max route length in km (L)
-U_TRANSFER      = 5.0      # transfer penalty (same units as edge weights, km here)
-MAX_GENERATIONS  = 1000     # GA iterations
+K_INS           = 500      # INS cardinality (top-K most-active nodes)
+MAX_NODES_ROUTE = 63       # max stops per route (M)
+MIN_NODES_ROUTE = 20       # min stops per route (M)
+
+MAX_LEN_ROUTE    = 55      # max route length in km (L)
+U_TRANSFER       = 5.0     # transfer penalty (same units as edge weights, km here)
+MAX_GENERATIONS  = 1000    # GA iterations
 CROSSOVER_PROB   = 0.5     # inter-string crossover probability
-MUTATION_PROB    = 0.1    # per-node mutation probability
+MUTATION_PROB    = 0    # per-node mutation probability
 CHECKPOINT_EVERY = 10      # save routes snapshot every N generations (0 = disabled)
 
 # Intra crossover: skip tail-swap if any distinct stop from one branch vs the other
-# is closer than this (Haversine, meters). All pairs across the two branches are checked.
-MIN_SPLICE_SEPARATION_M = 100.0
+# is closer than this (Haversine, km). All pairs across the two branches are checked.
+MIN_SPLICE_SEPARATION_M = 0.1
 
 # Fitness weights (ω1, ω2, ω3)
 OMEGA           = (1.0, 1.0, 1.0)
@@ -91,6 +93,7 @@ X_M             = 15.0
 
 RANDOM_SEED     = 42
 
+haversine_distance = {}
 
 # ── Data loading ──────────────────────────────────────────────────────────────
 
@@ -205,6 +208,35 @@ def compute_tmin(
 
     return t_min
 
+def haversine(lat1, lon1, lat2, lon2):
+    R = 6371  # Earth radius in km
+    phi1 = math.radians(float(lat1))
+    phi2 = math.radians(float(lat2))
+    dphi = math.radians(float(lat2) - float(lat1))
+    dlambda = math.radians(float(lon2) - float(lon1))
+    a = math.sin(dphi/2)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda/2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c  # distance in km
+
+def calculate_haversine_of_all_nodes(gd: GraphData) -> None:
+    for node1 in gd.nodes:
+        for node2 in gd.nodes:
+            if node1 != node2:
+                haversine_distance[(node1, node2)] = haversine(gd.nodes[node1]['coords']['lat'], 
+                gd.nodes[node1]['coords']['lng'], 
+                gd.nodes[node2]['coords']['lat'],
+                gd.nodes[node2]['coords']['lng'])
+
+def good_route(route: Route, gd: GraphData) -> bool:
+    for node1 in route:
+        for node2 in route:
+            if node1 != node2 and haversine_distance[(node1, node2)] < MIN_SPLICE_SEPARATION_M:
+                return False
+    
+    if len(route) < MIN_NODES_ROUTE  or len(route) > MAX_NODES_ROUTE:
+        return False
+    
+    return True
 
 # ── IRSG — Initial Route Set Generation ──────────────────────────────────────
 
@@ -239,7 +271,7 @@ def _direction_bias(
 
     cosine = (dx_cur * dx_new + dy_cur * dy_new) / (norm_cur * norm_new)
     # Map [-1, 1] → [0.05, 1.0]
-    return max(0.05, (cosine + 1.0) / 2.0)
+    return max(0, (cosine + 1.0) / 2.0)
 
 
 def _build_one_route(
@@ -269,9 +301,12 @@ def _build_one_route(
             a_k = float(activity[gd.id_to_idx[tgt]])
             d_k = _direction_bias(gd.nodes, prev_id, current_id, tgt)
             weights.append(max(1e-9, d_k * a_k))
+            # print(d_k, a_k, d_k * a_k, sep="------")
 
         total_w = sum(weights)
         probs = [w / total_w for w in weights]
+        # print(*probs)
+        # print("*"*20)
 
         # Check termination criteria before committing
         chosen_tgt, chosen_edge_w = rng.choices(vns, weights=probs, k=1)[0]
@@ -280,6 +315,9 @@ def _build_one_route(
             break
         if total_len + chosen_edge_w > MAX_LEN_ROUTE:
             break
+
+        # if not good_route(route, gd):
+         #   continue
 
         route.append(chosen_tgt)
         route_set.add(chosen_tgt)
@@ -310,7 +348,7 @@ def irsg(
         ins_set: set[int] = set(ins)
 
         route_set: RouteSet = []
-        for _ in range(R):
+        while len(route_set) < R:
             ins_list = list(ins_set)
             acts = [activity[i] for i in ins_list]
             total_a = sum(acts)
@@ -332,8 +370,12 @@ def irsg(
                         break
 
             route = _build_one_route(gd, activity, rng, first_node)
+            if not good_route(route, gd):
+                ins_set.add(chosen_idx)
+                continue
+            # print(len(route_set))
             route_set.append(route)
-
+    
         population.append(route_set)
 
     return population
@@ -525,7 +567,6 @@ def eval_route_set(
 
 
 # ── MODIFY — GA Operators ─────────────────────────────────────────────────────
-
 def crossover_inter(
     rs1: RouteSet,
     rs2: RouteSet,
@@ -543,37 +584,6 @@ def crossover_inter(
     child1: RouteSet = [r[:] for r in rs1[:cut]] + [r[:] for r in rs2[cut:]]
     child2: RouteSet = [r[:] for r in rs2[:cut]] + [r[:] for r in rs1[cut:]]
     return child1, child2
-
-def haversine(lat1, lon1, lat2, lon2):
-    R = 6371  # Earth radius in km
-
-    phi1 = math.radians(float(lat1))
-    phi2 = math.radians(float(lat2))
-    dphi = math.radians(float(lat2) - float(lat1))
-    dlambda = math.radians(float(lon2) - float(lon1))
-
-    a = math.sin(dphi/2)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda/2)**2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
-    return R * c  # distance in km
-
-def distance(node1: str, node2: str, gd: GraphData) -> float:
-    return haversine(gd.nodes[node1]['coords']['lat'], 
-    gd.nodes[node1]['coords']['lng'], 
-    gd.nodes[node2]['coords']['lat'], 
-    gd.nodes[node2]['coords']['lng'])
-
-def good_route(route: Route, gd: GraphData) -> bool:
-    for node1 in route:
-        for node2 in route:
-            if node1 != node2 and distance(node1, node2, gd) < MIN_SPLICE_SEPARATION_M:
-                return False
-    
-    if len(route) < 19 or len(route) > 100:
-        return False
-    
-    return True
-
 
 def crossover_intra(rs: RouteSet, rng: random.Random, gd: GraphData) -> RouteSet:
     """
@@ -806,6 +816,9 @@ def main() -> None:
     unreachable = int(np.isinf(t_min).sum() - n_stops)  # exclude diagonal
     print(f"  Done in {time.time()-t0:.1f}s | Unreachable pairs: {unreachable}")
 
+    print("Calculating haversine of all nodes …")
+    calculate_haversine_of_all_nodes(gd)
+
     print("Loading existing routes for population seeding …")
     existing_routes = load_existing_routes(gd.id_to_idx)
     print(f"  Parsed {len(existing_routes)} existing route directions")
@@ -831,6 +844,7 @@ def main() -> None:
             best_rs = rs
             best_metrics = metrics
         label = "seeded" if i == 0 else f"IRSG-{i}"
+        _save_checkpoint(i, rs, fit, metrics)
         print(f"  [{label}] TOTFIT={fit:.3f}  d0={metrics['d0p']:.1f}%  "
               f"d1={metrics['d1p']:.1f}%  ATT={metrics['ATT']:.2f}")
 
@@ -864,7 +878,7 @@ def main() -> None:
             for i in range(0, len(expanded) - 1, 2):
                 if _exp_is_elite_slot(i) or _exp_is_elite_slot(i + 1):
                     continue
-                if rng.random() < CROSSOVER_PROB:
+                if rng.random()< CROSSOVER_PROB:
                     expanded[i], expanded[i + 1] = crossover_inter(
                         expanded[i], expanded[i + 1], rng
                     )
