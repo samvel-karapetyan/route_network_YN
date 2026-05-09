@@ -8,14 +8,16 @@ Inputs  (all under data/):
   demand_matrix.npy            (1387, 1387) log1p-scaled OD demand
   node_index.json              nodeId -> matrix row/col index
   allYerevanTransportLines.json  74 existing routes (optional seed for one population member)
+  line_return_mapping/output/global_stop_to_return.json  optional; if present, fitness
+                               uses outbound + synthetic return per route (see --no-return-partners-eval).
 
-CLI (see --help): --output-dir, --seed, --no-seed-existing.
+CLI (see --help): --output-dir, --seed, --no-seed-existing, --no-return-partners-eval.
 
 Outputs (under OUTPUT_DIR, overridable with --output-dir):
   best_routes.json             optimised route set (list of stop-ID sequences)
   optimization_log.csv         per-generation metrics
   optimization_progress.png    optional chart from plot_results
-  checkpoints/                 periodic snapshots + maps
+  checkpoints/                 periodic snapshots + mapsժ
   routes_map.html              final interactive map
 """
 
@@ -41,6 +43,7 @@ class OptimizerCliArgs(NamedTuple):
     output_dir: Path
     seed: int
     seed_with_existing_routes: bool
+    use_return_partners_in_eval: bool
 
 # Optional live plotting — renders optimization_progress.png after each generation
 try:
@@ -59,16 +62,30 @@ except ImportError:
 # Optional route map — renders an interactive HTML map from a route set
 try:
     from visualize_routes import load_graph as _load_graph_for_map, build_html as _build_html
-    def _save_route_map(route_set: RouteSet, metrics: dict, totfit: float, out_html: Path, label: str) -> None:  # type: ignore[misc]
+    def _save_route_map(  # type: ignore[misc]
+        route_set: RouteSet,
+        metrics: dict,
+        totfit: float,
+        out_html: Path,
+        label: str,
+        return_routes: RouteSet | None = None,
+    ) -> None:
         try:
             nodes, _ = _load_graph_for_map(DATA_DIR / "transitGraph.json")
-            html = _build_html(route_set, nodes, metrics, totfit, label)
+            html = _build_html(route_set, nodes, metrics, totfit, label, return_routes)
             out_html.parent.mkdir(parents=True, exist_ok=True)
             out_html.write_text(html, encoding="utf-8")
         except Exception:
             pass
 except ImportError:
-    def _save_route_map(route_set: RouteSet, metrics: dict, totfit: float, out_html: Path, label: str) -> None:  # type: ignore[misc]
+    def _save_route_map(  # type: ignore[misc]
+        route_set: RouteSet,
+        metrics: dict,
+        totfit: float,
+        out_html: Path,
+        label: str,
+        return_routes: RouteSet | None = None,
+    ) -> None:
         pass
 
 # ── Type aliases ──────────────────────────────────────────────────────────────
@@ -79,6 +96,8 @@ RouteSet = list[Route]     # R routes forming one "solution"
 DATA_DIR        = Path("data")
 # All run artefacts (log, checkpoints, best JSON, plots, maps). Override via --output-dir.
 OUTPUT_DIR      = Path(".")
+# Built by line_return_mapping/global_stop_return_map.py — stop ↔ partner on return corridor
+RETURN_PARTNER_JSON = Path(__file__).resolve().parent / "line_return_mapping" / "output" / "global_stop_to_return.json"
 
 R               = 74       # routes per route set
 N_POP           = 20       # population size
@@ -92,7 +111,7 @@ MAX_LEN_ROUTE    = 55      # max route length in km (L)
 U_TRANSFER       = 5.0     # transfer penalty (same units as edge weights, km here)
 MAX_GENERATIONS  = 1000    # GA iterations
 CROSSOVER_PROB   = 0.5     # inter-string crossover probability
-MUTATION_PROB    = 0    # per-node mutation probability
+MUTATION_PROB    = 0.001    # per-node mutation probability
 CHECKPOINT_EVERY = 10      # save routes snapshot every N generations (0 = disabled)
 
 # Minimum great-circle distance between any two distinct stops on ONE route [km].
@@ -166,16 +185,28 @@ def load_graph_data() -> GraphData:
     return GraphData(nodes, adj, adj_list, demand, node_ids, id_to_idx)
 
 
-def load_existing_routes(id_to_idx: dict[str, int]) -> list[Route]:
-    """Parse allYerevanTransportLines.json → list of valid stop-ID sequences."""
+def load_existing_routes(
+    id_to_idx: dict[str, int],
+    *,
+    include_return_lines: bool = False,
+) -> list[Route]:
+    """
+    Parse allYerevanTransportLines.json → list of valid stop-ID sequences.
+
+    By default returns only outbound `line` directions (matches evaluate_existing.py
+    so the seeded individual reproduces the Yerevan baseline exactly). Pass
+    ``include_return_lines=True`` to also include `returnLine` directions
+    (~145 entries instead of 74).
+    """
     with open(DATA_DIR / "allYerevanTransportLines.json", encoding="utf-8") as f:
         lines: list[dict] = json.load(f)
 
     valid_ids = set(id_to_idx.keys())
+    direction_keys = ("line", "returnLine") if include_return_lines else ("line",)
     routes: list[Route] = []
 
     for entry in lines:
-        for direction_key in ("line", "returnLine"):
+        for direction_key in direction_keys:
             seq: list[dict] = entry.get(direction_key, [])
             stop_ids: Route = [
                 item["id"]
@@ -523,21 +554,27 @@ def seed_from_existing(
     gd: GraphData,
 ) -> RouteSet:
     """
-    Build one RouteSet by sampling R routes from parsed real lines.
-    Only routes that pass good_route(...) are eligible (no duplicate stops / min spacing).
+    Build the seeded individual from parsed real Yerevan lines, *verbatim and in source
+    order*, so the seeded checkpoint (gen_0000) reproduces the same network that
+    evaluate_existing.py scores.
+
+    No `good_route` filter is applied — the routes go straight into EVAL. MODIFY
+    operators (crossover/mutation) re-impose `good_route` on their offspring, so
+    even routes outside the configured length / spacing limits cannot proliferate.
+
+    If `len(existing) >= R` the first R routes are kept; otherwise the list is
+    padded with random choices from the available routes.
     """
-    valid = [r for r in existing if good_route(r, gd)]
-    if not valid:
+    if not existing:
         raise ValueError(
-            "No existing route direction passes good_route (unique stops + min pairwise "
-            f"separation {MIN_PAIRWISE_STOP_SEP_KM} km). Use --no-seed-existing or relax limits."
+            "load_existing_routes returned no routes. Use --no-seed-existing "
+            "or check data/allYerevanTransportLines.json."
         )
-    if len(valid) >= R:
-        return rng.sample(valid, R)
-    result = list(valid)
-    pool = valid
+    if len(existing) >= R:
+        return [list(r) for r in existing[:R]]
+    result: RouteSet = [list(r) for r in existing]
     while len(result) < R:
-        result.append(rng.choice(pool))
+        result.append(list(rng.choice(existing)))
     return result
 
 
@@ -560,6 +597,65 @@ def _build_stop_on_routes(
             if s is not None:
                 sor[s, r_idx] = 1.0
     return sor
+
+
+def load_return_partner_map(path: Path = RETURN_PARTNER_JSON) -> dict[str, str] | None:
+    """Load outbound/return partner JSON; None if missing or invalid."""
+    if not path.is_file():
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw: object = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    out: dict[str, str] = {}
+    for k, v in raw.items():
+        if k is None or v is None:
+            continue
+        ks, vs = str(k), str(v)
+        if ks != vs:
+            out[ks] = vs
+    return out if out else None
+
+
+def build_synthetic_return_route(
+    outbound: Route,
+    partner_map: dict[str, str],
+    id_to_idx: dict[str, int],
+) -> Route:
+    """
+    Reverse outbound order; each stop maps to its partner stop when available.
+    Collapse consecutive duplicates. If fewer than two usable stops, fall back to
+    reversed outbound (same geometry, opposite direction).
+    """
+    valid = [sid for sid in outbound if sid in id_to_idx]
+    if len(valid) < 2:
+        return []
+    seq: list[str] = []
+    for sid in reversed(valid):
+        pid = partner_map.get(sid)
+        if pid is None or pid == sid or pid not in id_to_idx:
+            continue
+        if not seq or seq[-1] != pid:
+            seq.append(pid)
+    if len(seq) < 2:
+        seq = list(reversed(valid))
+    return seq
+
+
+def expand_route_set_with_return_routes(
+    route_set: RouteSet,
+    partner_map: dict[str, str],
+    id_to_idx: dict[str, int],
+) -> RouteSet:
+    """Each outbound route is followed by one synthetic return route (2× routes for eval)."""
+    expanded: RouteSet = []
+    for route in route_set:
+        expanded.append(route)
+        expanded.append(build_synthetic_return_route(route, partner_map, id_to_idx))
+    return expanded
 
 
 def _route_cumulative_ivt(
@@ -595,9 +691,15 @@ def eval_route_set(
     demand: np.ndarray,
     t_min: np.ndarray,
     gd: GraphData,
+    partner_map: dict[str, str] | None = None,
 ) -> tuple[float, dict]:
     """
     Evaluate one route set. Returns (TOTFIT, metrics_dict).
+
+    If ``partner_map`` is set, fitness is computed on an expanded route set: each
+    outbound route is immediately followed by a synthetic return route built
+    from ``global_stop_to_return.json`` (reverse order + partner stops), so
+    coverage and IVT reflect both directions of each line.
 
     Coverage approach:
       sor  (N × R) stop-on-routes binary matrix
@@ -606,14 +708,20 @@ def eval_route_set(
       d1_reach[i,j]  = sor @ route_overlap_offdiag @ sor.T > 0  (one transfer)
       d2_reach[i,j]  = sor @ route_2hop @ sor.T > 0   (two transfers)
 
-    All matmuls have inner dimension R=70 — efficient regardless of N.
+    With return partners, R_eval = 2 × len(route_set); matmul cost scales accordingly.
     """
     n_stops = len(gd.node_ids)
     total_demand = float(demand.sum())
     if total_demand == 0:
         raise ValueError("Demand matrix is all zeros.")
 
-    sor = _build_stop_on_routes(route_set, gd.id_to_idx, n_stops)  # (N, R)
+    rs_eval: RouteSet = (
+        expand_route_set_with_return_routes(route_set, partner_map, gd.id_to_idx)
+        if partner_map
+        else route_set
+    )
+
+    sor = _build_stop_on_routes(rs_eval, gd.id_to_idx, n_stops)  # (N, R_eval)
 
     # ── Demand coverage ───────────────────────────────────────────────────────
     d0_reach: np.ndarray = (sor @ sor.T) > 0          # (N, N) bool
@@ -665,7 +773,7 @@ def eval_route_set(
     # ── F1: in-vehicle travel time score (Eq. 4–5) ────────────────────────────
     # Build IVT matrix for direct (d0) pairs
     ivt_mat = np.full((n_stops, n_stops), np.inf, dtype=np.float64)
-    for route in route_set:
+    for route in rs_eval:
         valid = [sid for sid in route if sid in gd.id_to_idx]
         if len(valid) < 2:
             continue
@@ -920,6 +1028,8 @@ def _save_checkpoint(
     *,
     random_seed: int,
     seed_with_existing_routes: bool,
+    partner_map: dict[str, str] | None = None,
+    id_to_idx: dict[str, int] | None = None,
 ) -> None:
     """
     Write three files atomically at every checkpoint:
@@ -930,11 +1040,18 @@ def _save_checkpoint(
     ckpt_dir = output_dir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
+    return_routes: RouteSet | None = None
+    if partner_map is not None and id_to_idx is not None:
+        return_routes = [
+            build_synthetic_return_route(r, partner_map, id_to_idx) for r in route_set
+        ]
+
     payload = {
         "generation":               gen,
         "best_TOTFIT":              totfit,
         "metrics":                  metrics,
         "routes":                   route_set,
+        "return_routes":            return_routes if return_routes else [],
         "random_seed":              random_seed,
         "seed_with_existing_routes": seed_with_existing_routes,
     }
@@ -944,7 +1061,9 @@ def _save_checkpoint(
         json.dump(payload, f, indent=2)
 
     map_path = ckpt_dir / f"gen_{gen:04d}_map.html"
-    _save_route_map(route_set, metrics, totfit, map_path, f"checkpoint gen {gen}")
+    _save_route_map(
+        route_set, metrics, totfit, map_path, f"checkpoint gen {gen}", return_routes
+    )
 
     # Keep best_routes.json up-to-date so it's always valid even if the run is interrupted
     best_path = output_dir / "best_routes.json"
@@ -990,6 +1109,14 @@ def _parse_args() -> OptimizerCliArgs:
             "as the first individual; initial population is entirely IRSG-generated."
         ),
     )
+    parser.add_argument(
+        "--no-return-partners-eval",
+        action="store_true",
+        help=(
+            "Do not append synthetic return routes from line_return_mapping/output/"
+            "global_stop_to_return.json when computing TOTFIT (outbound-only eval)."
+        ),
+    )
     ns = parser.parse_args()
     out_dir: Path = ns.output_dir.expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -997,6 +1124,7 @@ def _parse_args() -> OptimizerCliArgs:
         output_dir=out_dir,
         seed=ns.seed,
         seed_with_existing_routes=not ns.no_seed_existing,
+        use_return_partners_in_eval=not ns.no_return_partners_eval,
     )
 
 
@@ -1034,13 +1162,29 @@ def main() -> None:
     print("Calculating haversine of all nodes …")
     calculate_haversine_of_all_nodes(gd)
 
+    partner_map: dict[str, str] | None = None
+    if cli.use_return_partners_in_eval:
+        partner_map = load_return_partner_map(RETURN_PARTNER_JSON)
+        if partner_map:
+            print(
+                f"Fitness eval: outbound + synthetic return per route "
+                f"({RETURN_PARTNER_JSON.name}, {len(partner_map)} partner entries) → "
+                f"{2 * R} eval routes per individual."
+            )
+        else:
+            print(
+                f"  No usable return partner file at {RETURN_PARTNER_JSON} — "
+                "evaluating outbound routes only (run line_return_mapping/global_stop_return_map.py)."
+            )
+
     if cli.seed_with_existing_routes:
         print("Loading existing routes for population seeding …")
         existing_routes = load_existing_routes(gd.id_to_idx)
         n_ok_existing = sum(1 for r in existing_routes if good_route(r, gd))
         print(
-            f"  Parsed {len(existing_routes)} existing route directions; "
-            f"{n_ok_existing} pass good_route (unique stops + ≥{MIN_PAIRWISE_STOP_SEP_KM} km apart)"
+            f"  Parsed {len(existing_routes)} existing outbound directions; "
+            f"{n_ok_existing} pass good_route (unique stops + ≥{MIN_PAIRWISE_STOP_SEP_KM} km apart). "
+            "Seed uses ALL of them verbatim — gen_0000 == Yerevan baseline."
         )
 
         print(f"Generating {N_POP - 1} random initial route sets via IRSG …")
@@ -1061,7 +1205,7 @@ def main() -> None:
     best_metrics: dict = {}
 
     for i, rs in enumerate(population):
-        fit, metrics = eval_route_set(rs, gd.demand, t_min, gd)
+        fit, metrics = eval_route_set(rs, gd.demand, t_min, gd, partner_map)
         fitnesses.append(fit)
         if fit > best_fit:
             best_fit = fit
@@ -1079,6 +1223,8 @@ def main() -> None:
             output_dir,
             random_seed=cli.seed,
             seed_with_existing_routes=cli.seed_with_existing_routes,
+            partner_map=partner_map,
+            id_to_idx=gd.id_to_idx,
         )
         print(f"  [{label}] TOTFIT={fit:.3f}  d0={metrics['d0p']:.1f}%  "
               f"d1={metrics['d1p']:.1f}%  ATT={metrics['ATT']:.2f}")
@@ -1127,7 +1273,7 @@ def main() -> None:
             exp_fitnesses: list[float] = []
             exp_metrics_list: list[dict] = []
             for rs in expanded:
-                fit, metrics = eval_route_set(rs, gd.demand, t_min, gd)
+                fit, metrics = eval_route_set(rs, gd.demand, t_min, gd, partner_map)
                 exp_fitnesses.append(fit)
                 exp_metrics_list.append(metrics)
                 if fit > best_fit:
@@ -1197,14 +1343,23 @@ def main() -> None:
                     output_dir,
                     random_seed=cli.seed,
                     seed_with_existing_routes=cli.seed_with_existing_routes,
+                    partner_map=partner_map,
+                    id_to_idx=gd.id_to_idx,
                 )
 
     # ── Save final best route set ─────────────────────────────────────────────
+    final_return_routes: RouteSet | None = None
+    if partner_map is not None:
+        final_return_routes = [
+            build_synthetic_return_route(r, partner_map, gd.id_to_idx) for r in best_rs
+        ]
+
     output = {
         "n_routes":                   len(best_rs),
         "best_TOTFIT":                best_fit,
         "metrics":                    best_metrics,
         "routes":                     best_rs,
+        "return_routes":              final_return_routes if final_return_routes else [],
         "random_seed":                cli.seed,
         "seed_with_existing_routes":  cli.seed_with_existing_routes,
     }
@@ -1213,7 +1368,9 @@ def main() -> None:
         json.dump(output, f, indent=2)
 
     map_path = output_dir / "routes_map.html"
-    _save_route_map(best_rs, best_metrics, best_fit, map_path, "final best")
+    _save_route_map(
+        best_rs, best_metrics, best_fit, map_path, "final best", final_return_routes
+    )
 
     print(f"\nOptimisation complete.")
     print(f"  Output dir  : {output_dir}")
