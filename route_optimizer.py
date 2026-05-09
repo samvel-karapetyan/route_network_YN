@@ -7,15 +7,21 @@ Inputs  (all under data/):
   transitGraph.json            1387 nodes, 6375 directed multigraph edges
   demand_matrix.npy            (1387, 1387) log1p-scaled OD demand
   node_index.json              nodeId -> matrix row/col index
-  allYerevanTransportLines.json  74 existing routes (seeds one population member)
+  allYerevanTransportLines.json  74 existing routes (optional seed for one population member)
 
-Outputs:
+CLI (see --help): --output-dir, --seed, --no-seed-existing.
+
+Outputs (under OUTPUT_DIR, overridable with --output-dir):
   best_routes.json             optimised route set (list of stop-ID sequences)
   optimization_log.csv         per-generation metrics
+  optimization_progress.png    optional chart from plot_results
+  checkpoints/                 periodic snapshots + maps
+  routes_map.html              final interactive map
 """
 
 from __future__ import annotations
 
+import argparse
 import copy
 import csv
 import heapq
@@ -28,13 +34,22 @@ from typing import NamedTuple
 
 import numpy as np
 
+
+class OptimizerCliArgs(NamedTuple):
+    """Parsed CLI options for a single optimisation run."""
+
+    output_dir: Path
+    seed: int
+    seed_with_existing_routes: bool
+
 # Optional live plotting — renders optimization_progress.png after each generation
 try:
     from plot_results import render as _render_plot
-    _PLOT_OUT = Path("optimization_progress.png")
+
     def _save_plot(log_path: Path) -> None:
         try:
-            _render_plot(log_path, _PLOT_OUT)
+            plot_out = log_path.with_name("optimization_progress.png")
+            _render_plot(log_path, plot_out)
         except Exception:
             pass  # never crash the optimizer because of plotting
 except ImportError:
@@ -62,6 +77,8 @@ RouteSet = list[Route]     # R routes forming one "solution"
 
 # ── Parameters ────────────────────────────────────────────────────────────────
 DATA_DIR        = Path("data")
+# All run artefacts (log, checkpoints, best JSON, plots, maps). Override via --output-dir.
+OUTPUT_DIR      = Path(".")
 
 R               = 74       # routes per route set
 N_POP           = 20       # population size
@@ -78,9 +95,18 @@ CROSSOVER_PROB   = 0.5     # inter-string crossover probability
 MUTATION_PROB    = 0    # per-node mutation probability
 CHECKPOINT_EVERY = 10      # save routes snapshot every N generations (0 = disabled)
 
-# Intra crossover: skip tail-swap if any distinct stop from one branch vs the other
-# is closer than this (Haversine, km). All pairs across the two branches are checked.
-MIN_SPLICE_SEPARATION_M = 0.1
+# Minimum great-circle distance between any two distinct stops on ONE route [km].
+# 0.1 km == 100 m. Applied in good_route(...): two different nodes closer than this
+# cannot appear on the same line (distinct IDs only — duplicate IDs are rejected separately).
+# Note: Maps often draw straight chords between consecutive stops; those segments can cross
+# without visiting an intermediate stop (graph path vs straight-line geometry).
+MIN_PAIRWISE_STOP_SEP_KM = 0.1
+
+# If True, reject a route when any two non-consecutive chord segments (straight lines between
+# consecutive stops in map order) intersect in the (lng, lat) plane — same convention as typical
+# Leaflet polylines over a small city extent. Stops may all differ and be ≥100 m apart but chords
+# can still cross (e.g. opposite sides of an interchange).
+REJECT_POLYLINE_SELF_INTERSECTION = True
 
 # Fitness weights (ω1, ω2, ω3)
 OMEGA           = (1.0, 1.0, 1.0)
@@ -227,15 +253,125 @@ def calculate_haversine_of_all_nodes(gd: GraphData) -> None:
                 gd.nodes[node2]['coords']['lat'],
                 gd.nodes[node2]['coords']['lng'])
 
-def good_route(route: Route, gd: GraphData) -> bool:
-    for node1 in route:
-        for node2 in route:
-            if node1 != node2 and haversine_distance[(node1, node2)] < MIN_SPLICE_SEPARATION_M:
-                return False
-    
-    if len(route) < MIN_NODES_ROUTE  or len(route) > MAX_NODES_ROUTE:
+def _node_lng_lat(node_id: str, gd: GraphData) -> tuple[float, float]:
+    c = gd.nodes[node_id]["coords"]
+    return (float(c["lng"]), float(c["lat"]))
+
+
+_SEG_INTER_PAR_EPS = 1e-15  # parallel denominator threshold (degrees²-scale)
+_SEG_INTER_T_EPS = 1e-12    # parametric intersection tolerance along segments
+
+
+def _collinear_seg_overlap_on_ab(
+    ax: float,
+    ay: float,
+    bx: float,
+    by: float,
+    cx: float,
+    cy: float,
+    dx: float,
+    dy: float,
+) -> bool:
+    """Return True if segments AB and CD overlap on the same line with positive length."""
+    dx_ab = bx - ax
+    dy_ab = by - ay
+    len2 = dx_ab * dx_ab + dy_ab * dy_ab
+    if len2 < 1e-22:
         return False
-    
+
+    def dot_from_a(px: float, py: float) -> float:
+        return (px - ax) * dx_ab + (py - ay) * dy_ab
+
+    t1_lo, t1_hi = 0.0, len2
+    tc, td = dot_from_a(cx, cy), dot_from_a(dx, dy)
+    t2_lo, t2_hi = min(tc, td), max(tc, td)
+    overlap = min(t1_hi, t2_hi) - max(t1_lo, t2_lo)
+    scale = math.sqrt(len2)
+    return overlap > max(1e-9 * scale, 1e-12)
+
+
+def _chord_segments_intersect(
+    ax: float,
+    ay: float,
+    bx: float,
+    by: float,
+    cx: float,
+    cy: float,
+    dx: float,
+    dy: float,
+) -> bool:
+    """
+    True iff closed segments AB and CD intersect (including collinear overlap).
+    Uses segment parameters t, u in [0,1] for P=A+t(B-A), Q=C+u(D-C).
+    """
+    rx = bx - ax
+    ry = by - ay
+    sx = dx - cx
+    sy = dy - cy
+    denom = rx * sy - ry * sx
+    if abs(denom) < _SEG_INTER_PAR_EPS:
+        scale_ab = max(math.hypot(rx, ry), 1e-15)
+        cross_c = rx * (cy - ay) - ry * (cx - ax)
+        cross_d = rx * (dy - ay) - ry * (dx - ax)
+        tol = 1e-9 * scale_ab
+        if abs(cross_c) > tol or abs(cross_d) > tol:
+            return False
+        return _collinear_seg_overlap_on_ab(ax, ay, bx, by, cx, cy, dx, dy)
+
+    t = ((cx - ax) * sy - (cy - ay) * sx) / denom
+    u = ((cx - ax) * ry - (cy - ay) * rx) / denom
+    return (
+        -_SEG_INTER_T_EPS <= t <= 1.0 + _SEG_INTER_T_EPS
+        and -_SEG_INTER_T_EPS <= u <= 1.0 + _SEG_INTER_T_EPS
+    )
+
+
+def _route_polyline_self_intersects(route: Route, gd: GraphData) -> bool:
+    """
+    True if the polyline connecting consecutive stops has a self-intersection
+    (two non-consecutive edges crossing or overlapping in lng–lat space).
+    """
+    n = len(route)
+    if n < 4:
+        return False
+    pts: list[tuple[float, float]] = [_node_lng_lat(nid, gd) for nid in route]
+    for i in range(n - 1):
+        ax, ay = pts[i]
+        bx, by = pts[i + 1]
+        for j in range(i + 2, n - 1):
+            cx, cy = pts[j]
+            dx, dy = pts[j + 1]
+            if _chord_segments_intersect(ax, ay, bx, by, cx, cy, dx, dy):
+                return True
+    return False
+
+
+def good_route(route: Route, gd: GraphData) -> bool:
+    """
+    Feasibility for a single line (ordered stop list).
+
+    - Each graph stop ID may appear at most once (no revisiting the same station).
+    - Any two different stops must be at least MIN_PAIRWISE_STOP_SEP_KM apart
+      (Haversine), so two distinct nodes within ~100 m cannot both be on the line.
+    - Optionally: consecutive-stop chords may not self-intersect (see
+      REJECT_POLYLINE_SELF_INTERSECTION).
+    """
+    if len(route) < MIN_NODES_ROUTE or len(route) > MAX_NODES_ROUTE:
+        return False
+
+    if len(route) != len(set(route)):
+        return False
+
+    n_route = len(route)
+    for i in range(n_route):
+        for j in range(i + 1, n_route):
+            a, b = route[i], route[j]
+            if haversine_distance[(a, b)] < MIN_PAIRWISE_STOP_SEP_KM:
+                return False
+
+    if REJECT_POLYLINE_SELF_INTERSECTION and _route_polyline_self_intersects(route, gd):
+        return False
+
     return True
 
 # ── IRSG — Initial Route Set Generation ──────────────────────────────────────
@@ -381,13 +517,27 @@ def irsg(
     return population
 
 
-def seed_from_existing(existing: list[Route], rng: random.Random) -> RouteSet:
-    """Build one RouteSet by sampling R routes from the existing parsed routes."""
-    if len(existing) >= R:
-        return rng.sample(existing, R)
-    result = list(existing)
+def seed_from_existing(
+    existing: list[Route],
+    rng: random.Random,
+    gd: GraphData,
+) -> RouteSet:
+    """
+    Build one RouteSet by sampling R routes from parsed real lines.
+    Only routes that pass good_route(...) are eligible (no duplicate stops / min spacing).
+    """
+    valid = [r for r in existing if good_route(r, gd)]
+    if not valid:
+        raise ValueError(
+            "No existing route direction passes good_route (unique stops + min pairwise "
+            f"separation {MIN_PAIRWISE_STOP_SEP_KM} km). Use --no-seed-existing or relax limits."
+        )
+    if len(valid) >= R:
+        return rng.sample(valid, R)
+    result = list(valid)
+    pool = valid
     while len(result) < R:
-        result.append(rng.choice(existing))
+        result.append(rng.choice(pool))
     return result
 
 
@@ -591,7 +741,7 @@ def crossover_intra(rs: RouteSet, rng: random.Random, gd: GraphData) -> RouteSet
     exchange tails at that node. Returns a modified shallow copy.
 
     Splices are skipped if any distinct stop pair across the two splice branches
-    (tail vs head on each side) is closer than MIN_SPLICE_SEPARATION_M.
+    (tail vs head on each side) is closer than MIN_PAIRWISE_STOP_SEP_KM.
     """
     rs = [r[:] for r in rs]
     if len(rs) < 2:
@@ -681,6 +831,7 @@ def mutate(
         if len(route) < 2:
             continue
 
+        original: Route = route[:]
         new_route: Route = []
         i = 0
         while i < len(route):
@@ -711,8 +862,10 @@ def mutate(
             new_route.append(node)
             i += 1
 
-        if len(new_route) >= 2:
+        if len(new_route) >= 2 and good_route(new_route, gd):
             rs[r_idx] = new_route
+        else:
+            rs[r_idx] = original
 
     return rs
 
@@ -758,21 +911,32 @@ def tournament_select(
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def _save_checkpoint(gen: int, route_set: RouteSet, totfit: float, metrics: dict) -> None:
+def _save_checkpoint(
+    gen: int,
+    route_set: RouteSet,
+    totfit: float,
+    metrics: dict,
+    output_dir: Path,
+    *,
+    random_seed: int,
+    seed_with_existing_routes: bool,
+) -> None:
     """
     Write three files atomically at every checkpoint:
-      checkpoints/gen_NNNN.json      — route set snapshot
-      checkpoints/gen_NNNN_map.html  — interactive map of that snapshot
-      best_routes.json               — always reflects the latest best (survives Ctrl+C)
+      {output_dir}/checkpoints/gen_NNNN.json      — route set snapshot
+      {output_dir}/checkpoints/gen_NNNN_map.html  — interactive map of that snapshot
+      {output_dir}/best_routes.json               — latest checkpoint payload (survives Ctrl+C)
     """
-    ckpt_dir = Path("checkpoints")
-    ckpt_dir.mkdir(exist_ok=True)
+    ckpt_dir = output_dir / "checkpoints"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     payload = {
-        "generation":  gen,
-        "best_TOTFIT": totfit,
-        "metrics":     metrics,
-        "routes":      route_set,
+        "generation":               gen,
+        "best_TOTFIT":              totfit,
+        "metrics":                  metrics,
+        "routes":                   route_set,
+        "random_seed":              random_seed,
+        "seed_with_existing_routes": seed_with_existing_routes,
     }
 
     json_path = ckpt_dir / f"gen_{gen:04d}.json"
@@ -783,16 +947,67 @@ def _save_checkpoint(gen: int, route_set: RouteSet, totfit: float, metrics: dict
     _save_route_map(route_set, metrics, totfit, map_path, f"checkpoint gen {gen}")
 
     # Keep best_routes.json up-to-date so it's always valid even if the run is interrupted
-    best_path = Path("best_routes.json")
+    best_path = output_dir / "best_routes.json"
     with open(best_path, "w") as f:
         json.dump(payload, f, indent=2)
 
     print(f"  [checkpoint] {json_path}  {map_path}  {best_path}")
 
 
+def _parse_args() -> OptimizerCliArgs:
+    parser = argparse.ArgumentParser(
+        description="GA-based transit route network optimizer.",
+    )
+    parser.add_argument(
+        "-o",
+        "--output-dir",
+        "--run-dir",
+        type=Path,
+        default=OUTPUT_DIR,
+        metavar="DIR",
+        help=(
+            "Directory for checkpoints/, optimization_log.csv, best_routes.json, "
+            "optimization_progress.png, and routes_map.html (created if missing). "
+            f"Default: {OUTPUT_DIR!s}"
+        ),
+    )
+    parser.add_argument(
+        "--seed",
+        "-s",
+        type=int,
+        default=RANDOM_SEED,
+        metavar="N",
+        help=(
+            "Seed for `random` and NumPy (`numpy.random`). "
+            f"Default: {RANDOM_SEED}."
+        ),
+    )
+    parser.add_argument(
+        "--no-seed-existing",
+        action="store_true",
+        help=(
+            "Do not prepend the real-world route network (from allYerevanTransportLines.json) "
+            "as the first individual; initial population is entirely IRSG-generated."
+        ),
+    )
+    ns = parser.parse_args()
+    out_dir: Path = ns.output_dir.expanduser().resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return OptimizerCliArgs(
+        output_dir=out_dir,
+        seed=ns.seed,
+        seed_with_existing_routes=not ns.no_seed_existing,
+    )
+
+
 def main() -> None:
-    rng = random.Random(RANDOM_SEED)
-    np.random.seed(RANDOM_SEED)
+    cli = _parse_args()
+    output_dir = cli.output_dir
+    print(f"Writing results under: {output_dir}")
+    print(f"Random seed: {cli.seed} (random + NumPy)")
+
+    rng = random.Random(cli.seed)
+    np.random.seed(cli.seed)
 
     if ELITE_COUNT > 0:
         if ELITE_COUNT >= N_POP:
@@ -819,16 +1034,25 @@ def main() -> None:
     print("Calculating haversine of all nodes …")
     calculate_haversine_of_all_nodes(gd)
 
-    print("Loading existing routes for population seeding …")
-    existing_routes = load_existing_routes(gd.id_to_idx)
-    print(f"  Parsed {len(existing_routes)} existing route directions")
+    if cli.seed_with_existing_routes:
+        print("Loading existing routes for population seeding …")
+        existing_routes = load_existing_routes(gd.id_to_idx)
+        n_ok_existing = sum(1 for r in existing_routes if good_route(r, gd))
+        print(
+            f"  Parsed {len(existing_routes)} existing route directions; "
+            f"{n_ok_existing} pass good_route (unique stops + ≥{MIN_PAIRWISE_STOP_SEP_KM} km apart)"
+        )
 
-    print(f"Generating {N_POP-1} random initial route sets via IRSG …")
-    t0 = time.time()
-    population: list[RouteSet] = irsg(gd, activity, rng, N_POP - 1)
-    seeded = seed_from_existing(existing_routes, rng)
-    population.insert(0, seeded)
-    print(f"  Done in {time.time()-t0:.1f}s")
+        print(f"Generating {N_POP - 1} random initial route sets via IRSG …")
+        t0 = time.time()
+        population = irsg(gd, activity, rng, N_POP - 1)
+        population.insert(0, seed_from_existing(existing_routes, rng, gd))
+        print(f"  Done in {time.time()-t0:.1f}s")
+    else:
+        print("Initial population: IRSG only (--no-seed-existing).")
+        t0 = time.time()
+        population = irsg(gd, activity, rng, N_POP)
+        print(f"  Generated {N_POP} route sets in {time.time()-t0:.1f}s")
 
     print("Evaluating initial population …")
     fitnesses: list[float] = []
@@ -843,12 +1067,23 @@ def main() -> None:
             best_fit = fit
             best_rs = rs
             best_metrics = metrics
-        label = "seeded" if i == 0 else f"IRSG-{i}"
-        _save_checkpoint(i, rs, fit, metrics)
+        if cli.seed_with_existing_routes and i == 0:
+            label = "seeded-existing"
+        else:
+            label = f"IRSG-{i}"
+        _save_checkpoint(
+            i,
+            rs,
+            fit,
+            metrics,
+            output_dir,
+            random_seed=cli.seed,
+            seed_with_existing_routes=cli.seed_with_existing_routes,
+        )
         print(f"  [{label}] TOTFIT={fit:.3f}  d0={metrics['d0p']:.1f}%  "
               f"d1={metrics['d1p']:.1f}%  ATT={metrics['ATT']:.2f}")
 
-    log_path = Path("optimization_log.csv")
+    log_path = output_dir / "optimization_log.csv"
     log_fields = ["generation", "best_TOTFIT", "d0p", "d1p", "d2p", "dunp",
                   "ATT", "F1", "F2", "F3"]
 
@@ -954,23 +1189,34 @@ def main() -> None:
 
             # ── Periodic route checkpoint ─────────────────────────────────────
             if CHECKPOINT_EVERY > 0 and (gen + 1) % CHECKPOINT_EVERY == 0:
-                _save_checkpoint(gen + 1, best_rs, best_fit, best_metrics)
+                _save_checkpoint(
+                    gen + 1,
+                    best_rs,
+                    best_fit,
+                    best_metrics,
+                    output_dir,
+                    random_seed=cli.seed,
+                    seed_with_existing_routes=cli.seed_with_existing_routes,
+                )
 
     # ── Save final best route set ─────────────────────────────────────────────
     output = {
-        "n_routes":    len(best_rs),
-        "best_TOTFIT": best_fit,
-        "metrics":     best_metrics,
-        "routes":      best_rs,
+        "n_routes":                   len(best_rs),
+        "best_TOTFIT":                best_fit,
+        "metrics":                    best_metrics,
+        "routes":                     best_rs,
+        "random_seed":                cli.seed,
+        "seed_with_existing_routes":  cli.seed_with_existing_routes,
     }
-    out_path = Path("best_routes.json")
+    out_path = output_dir / "best_routes.json"
     with open(out_path, "w") as f:
         json.dump(output, f, indent=2)
 
-    map_path = DATA_DIR / "routes_map.html"
+    map_path = output_dir / "routes_map.html"
     _save_route_map(best_rs, best_metrics, best_fit, map_path, "final best")
 
     print(f"\nOptimisation complete.")
+    print(f"  Output dir  : {output_dir}")
     print(f"  Best TOTFIT : {best_fit:.4f}")
     print(f"  d0={best_metrics.get('d0p',0):.1f}%  "
           f"d1={best_metrics.get('d1p',0):.1f}%  "

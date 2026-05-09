@@ -27,7 +27,7 @@ from PIL import Image
 RADIUS_M: Final[float] = 400.0   # pedestrian catchment radius in metres
 BETA: Final[float] = 2.0          # gravity decay exponent
 MIN_DIST_KM: Final[float] = 0.1  # minimum distance floor in km (prevents 1/dist² blow-up for co-located stops)
-LOG_TRANSFORM: Final[bool] = True # apply log1p after gravity model
+LOG_TRANSFORM: Final[bool] = False # apply log1p after gravity model
 NORMALIZE: Final[bool] = False    # if True, scale final matrix to [0, 1]
 BATCH_SIZE: Final[int] = 64       # stops processed per batch during aggregation
 
